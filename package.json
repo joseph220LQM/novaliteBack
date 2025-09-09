@@ -1,0 +1,23 @@
+{
+  "name": "novaliteback",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node --watch index.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@aws-sdk/client-bedrock-runtime": "^3.879.0",
+    "@aws-sdk/client-transcribe-streaming": "^3.883.0",
+    "@aws-sdk/util-utf8": "^3.310.0",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.2",
+    "express": "^5.1.0",
+    "ws": "^8.18.3"
+  }
+}
