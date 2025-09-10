@@ -12,6 +12,8 @@ import {
 } from "@aws-sdk/client-bedrock-runtime";
 import { Readable } from "stream";
 import dotenv from "dotenv";
+import fetch from "node-fetch";
+
 
 dotenv.config();
 
@@ -186,18 +188,49 @@ wss.on("connection", async (ws) => {
 });
 
 // === Endpoint REST para texto manual ===
-app.post("/chat", async (req, res) => {
-  const { prompt } = req.body;
-  if (!prompt) return res.status(400).json({ error: "Falta el prompt" });
-
+app.post("/speak", async (req, res) => {
   try {
-    const reply = await askBedrock(prompt);
-    res.json({ reply });
-  } catch (error) {
-    console.error("Error con Bedrock:", error);
-    res.status(500).json({ error: "Error al invocar Bedrock" });
+    const { text } = req.body;
+    if (!text || !text.trim()) return res.status(400).json({ error: "Falta texto" });
+
+    const voiceId = process.env.ELEVEN_VOICE_ID || "YPh7OporwNAJ28F5IQrm";
+
+    const r = await fetch(
+      `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream`,
+      {
+        method: "POST",
+        headers: {
+          "xi-api-key": process.env.ELEVENLABS_API_KEY,
+          "Content-Type": "application/json",
+          "Accept": "audio/mpeg",
+        },
+        body: JSON.stringify({
+          model_id: "eleven_turbo_v2_5",
+          text,
+          voice_settings: {
+            stability: 0.4,
+            similarity_boost: 0.9,
+            use_speaker_boost: true,
+          },
+        }),
+      }
+    );
+
+    if (!r.ok) {
+      const msg = await r.text();
+      console.error("❌ ElevenLabs respondió con error:", msg);
+      return res.status(500).send(msg);
+    }
+
+    res.setHeader("Content-Type", "audio/mpeg");
+    r.body.pipe(res);
+  } catch (e) {
+    console.error("❌ Error TTS inesperado:", e);
+    res.status(500).json({ error: e.message || "TTS error" });
   }
 });
+
+
 
 server.listen(PORT, () => {
   console.log(`🚀 Servidor corriendo en http://localhost:${PORT}`);
