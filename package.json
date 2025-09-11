@@ -13,6 +13,7 @@
   "description": "",
   "dependencies": {
     "@aws-sdk/client-bedrock-runtime": "^3.879.0",
+    "@aws-sdk/client-polly": "^3.886.0",
     "@aws-sdk/client-transcribe-streaming": "^3.883.0",
     "@aws-sdk/util-utf8": "^3.310.0",
     "cors": "^2.8.5",

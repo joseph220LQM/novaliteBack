@@ -10,10 +10,9 @@ import {
   BedrockRuntimeClient,
   ConverseCommand,
 } from "@aws-sdk/client-bedrock-runtime";
+import { PollyClient, SynthesizeSpeechCommand } from "@aws-sdk/client-polly";
 import { Readable } from "stream";
 import dotenv from "dotenv";
-import fetch from "node-fetch";
-
 
 dotenv.config();
 
@@ -28,7 +27,7 @@ const PORT = process.env.PORT || 4000;
 
 // === AWS Clients ===
 const transcribeClient = new TranscribeStreamingClient({
-  region: process.env.AWS_REGION || "us-east-1", // región Transcribe
+  region: process.env.AWS_REGION || "us-east-1",
   credentials: {
     accessKeyId: process.env.AWS_ACCESS_KEY_ID,
     secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
@@ -36,7 +35,15 @@ const transcribeClient = new TranscribeStreamingClient({
 });
 
 const bedrockClient = new BedrockRuntimeClient({
-  region: process.env.AWS_REGION || "us-east-1", // región Bedrock
+  region: process.env.AWS_REGION || "us-east-1",
+  credentials: {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+  },
+});
+
+const pollyClient = new PollyClient({
+  region: process.env.AWS_REGION || "us-east-1",
   credentials: {
     accessKeyId: process.env.AWS_ACCESS_KEY_ID,
     secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
@@ -109,11 +116,11 @@ const FEWSHOT_MESSAGES = [
 // === Función para invocar Bedrock ===
 async function askBedrock(prompt) {
   const command = new ConverseCommand({
-    modelId: "us.amazon.nova-lite-v1:0",
+    modelId: "us.amazon.nova-lite-v1:0", // puedes cambiar a nova-sonic para latencia baja
     messages: [
-      { role: "user", content: [{ text: MOZART_PROMPT }] }, // prompt maestro
-      ...FEWSHOT_MESSAGES, // ejemplos precargados
-      { role: "user", content: [{ text: prompt }] }, // entrada actual
+      { role: "user", content: [{ text: MOZART_PROMPT }] },
+      ...FEWSHOT_MESSAGES,
+      { role: "user", content: [{ text: prompt }] },
     ],
     inferenceConfig: {
       maxTokens: 512,
@@ -188,49 +195,44 @@ wss.on("connection", async (ws) => {
 });
 
 // === Endpoint REST para texto manual ===
-app.post("/speak", async (req, res) => {
+app.post("/chat", async (req, res) => {
+  const { prompt } = req.body;
+  if (!prompt) return res.status(400).json({ reply: "❌ Falta el prompt" });
+
   try {
-    const { text } = req.body;
-    if (!text || !text.trim()) return res.status(400).json({ error: "Falta texto" });
-
-    const voiceId = process.env.ELEVEN_VOICE_ID || "YPh7OporwNAJ28F5IQrm";
-
-    const r = await fetch(
-      `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream`,
-      {
-        method: "POST",
-        headers: {
-          "xi-api-key": process.env.ELEVENLABS_API_KEY,
-          "Content-Type": "application/json",
-          "Accept": "audio/mpeg",
-        },
-        body: JSON.stringify({
-          model_id: "eleven_turbo_v2_5",
-          text,
-          voice_settings: {
-            stability: 0.4,
-            similarity_boost: 0.9,
-            use_speaker_boost: true,
-          },
-        }),
-      }
-    );
-
-    if (!r.ok) {
-      const msg = await r.text();
-      console.error("❌ ElevenLabs respondió con error:", msg);
-      return res.status(500).send(msg);
-    }
-
-    res.setHeader("Content-Type", "audio/mpeg");
-    r.body.pipe(res);
-  } catch (e) {
-    console.error("❌ Error TTS inesperado:", e);
-    res.status(500).json({ error: e.message || "TTS error" });
+    const reply = await askBedrock(prompt);
+    res.json({ reply });
+  } catch (error) {
+    console.error("Error con Bedrock:", error);
+    res.json({ reply: "❌ Error al invocar Bedrock" });
   }
 });
 
+// === Endpoint TTS con Polly ===
+app.post("/speak", async (req, res) => {
+  try {
+    const { text } = req.body;
+    if (!text || !text.trim()) {
+      return res.status(400).json({ error: "Falta texto" });
+    }
 
+    const command = new SynthesizeSpeechCommand({
+      OutputFormat: "mp3",
+      Text: text,
+      VoiceId: "Mia",   // voz en español (puedes cambiarla)
+      Engine: "neural",   // usa motor Neural para voz más natural
+      LanguageCode: "es-MX",
+    });
+
+    const response = await pollyClient.send(command);
+
+    res.setHeader("Content-Type", "audio/mpeg");
+    response.AudioStream.pipe(res);
+  } catch (err) {
+    console.error("❌ Error Polly:", err);
+    res.status(500).json({ error: "Error en Polly" });
+  }
+});
 
 server.listen(PORT, () => {
   console.log(`🚀 Servidor corriendo en http://localhost:${PORT}`);
