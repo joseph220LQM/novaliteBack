@@ -1,3 +1,5 @@
+// index.js — MOZART demo con Transcribe + Bedrock + Polly (barge-in activado)
+
 import express from "express";
 import http from "http";
 import WebSocket, { WebSocketServer } from "ws";
@@ -75,10 +77,7 @@ Eres MOZART, el Cuidador Digital de COMPENSAR EPS.
 
 // === Few-shots (ejemplos de diálogo) ===
 const FEWSHOT_MESSAGES = [
-  {
-    role: "user",
-    content: [{ text: "Hola, ¿quién eres?" }],
-  },
+  { role: "user", content: [{ text: "Hola, ¿quién eres?" }] },
   {
     role: "assistant",
     content: [
@@ -87,10 +86,7 @@ const FEWSHOT_MESSAGES = [
       },
     ],
   },
-  {
-    role: "user",
-    content: [{ text: "¿En qué me apoyas antes de mi consulta?" }],
-  },
+  { role: "user", content: [{ text: "¿En qué me apoyas antes de mi consulta?" }] },
   {
     role: "assistant",
     content: [
@@ -99,10 +95,7 @@ const FEWSHOT_MESSAGES = [
       },
     ],
   },
-  {
-    role: "user",
-    content: [{ text: "¿Cómo ayuda MOZART a mi clínica?" }],
-  },
+  { role: "user", content: [{ text: "¿Cómo ayuda MOZART a mi clínica?" }] },
   {
     role: "assistant",
     content: [
@@ -113,7 +106,7 @@ const FEWSHOT_MESSAGES = [
   },
 ];
 
-// === Función para invocar Bedrock ===
+// === Bedrock ===
 async function askBedrock(prompt) {
   const command = new ConverseCommand({
     modelId: "us.amazon.nova-lite-v1:0", // puedes cambiar a nova-sonic para latencia baja
@@ -175,9 +168,7 @@ wss.on("connection", async (ws) => {
         for (const result of results) {
           if (result.Alternatives.length > 0) {
             const transcript = result.Alternatives[0].Transcript;
-            ws.send(
-              JSON.stringify({ transcript, isPartial: result.IsPartial })
-            );
+            ws.send(JSON.stringify({ transcript, isPartial: result.IsPartial }));
 
             // 🔥 Solo si es final, mandar a Bedrock
             if (!result.IsPartial) {
@@ -208,32 +199,97 @@ app.post("/chat", async (req, res) => {
   }
 });
 
-// === Endpoint TTS con Polly ===
+// ======================================================
+// ===============  BARGE-IN PARA TTS  ==================
+// ======================================================
+// Nota: En Node 18+ AbortController es global
+const ttsSessions = new Map(); // clientId -> { controller }
+
+function beginTtsSession(clientId) {
+  const prev = ttsSessions.get(clientId);
+  if (prev?.controller) {
+    try { prev.controller.abort(); } catch {}
+  }
+  const controller = new AbortController();
+  ttsSessions.set(clientId, { controller });
+  return controller;
+}
+
+function endTtsSession(clientId, controller) {
+  const cur = ttsSessions.get(clientId)?.controller;
+  if (cur === controller) ttsSessions.delete(clientId);
+}
+
+// === Endpoint TTS con Polly (con barge-in) ===
 app.post("/speak", async (req, res) => {
   try {
+    const clientId = req.query.clientId || req.header("x-client-id");
+    if (!clientId) {
+      return res
+        .status(400)
+        .json({ error: "Falta clientId (query ?clientId= o header x-client-id)" });
+    }
+
     const { text } = req.body;
     if (!text || !text.trim()) {
       return res.status(400).json({ error: "Falta texto" });
     }
 
+    // BARGE-IN: aborta stream previo y crea uno nuevo
+    const controller = beginTtsSession(clientId);
+
     const command = new SynthesizeSpeechCommand({
       OutputFormat: "mp3",
       Text: text,
-      VoiceId: "Mia",   // voz en español (puedes cambiarla)
-      Engine: "neural",   // usa motor Neural para voz más natural
+      VoiceId: "Mia", // puedes cambiar a "Lucia" (es-ES) o "Lupe" (es-US)
+      Engine: "neural",
       LanguageCode: "es-MX",
     });
 
-    const response = await pollyClient.send(command);
+    const pollyRes = await pollyClient.send(command, {
+      abortSignal: controller.signal,
+    });
 
     res.setHeader("Content-Type", "audio/mpeg");
-    response.AudioStream.pipe(res);
+
+    pollyRes.AudioStream.on("error", (err) => {
+      if (controller.signal.aborted) {
+        try { res.end(); } catch {}
+        return;
+      }
+      console.error("❌ Polly stream error:", err);
+      if (!res.headersSent) res.status(500);
+      try { res.end(); } catch {}
+    });
+
+    pollyRes.AudioStream.on("end", () => endTtsSession(clientId, controller));
+    pollyRes.AudioStream.on("close", () => endTtsSession(clientId, controller));
+
+    pollyRes.AudioStream.pipe(res);
   } catch (err) {
+    if (err?.name === "AbortError") {
+      try { res.end(); } catch {}
+      return;
+    }
     console.error("❌ Error Polly:", err);
-    res.status(500).json({ error: "Error en Polly" });
+    if (!res.headersSent) {
+      res.status(500).json({ error: "Error en Polly" });
+    }
   }
 });
 
+// (Opcional) Cortar audio actual sin iniciar otro
+app.post("/speak/stop", (req, res) => {
+  const clientId = req.query.clientId || req.header("x-client-id");
+  if (!clientId) return res.status(400).json({ error: "Falta clientId" });
+  const prev = ttsSessions.get(clientId);
+  if (prev?.controller) {
+    try { prev.controller.abort(); } catch {}
+  }
+  return res.json({ ok: true });
+});
+
+// === Start server ===
 server.listen(PORT, () => {
   console.log(`🚀 Servidor corriendo en http://localhost:${PORT}`);
 });
