@@ -13,7 +13,6 @@ import {
   InvokeAgentCommand,
 } from "@aws-sdk/client-bedrock-agent-runtime";
 import { PollyClient, SynthesizeSpeechCommand } from "@aws-sdk/client-polly";
-import { Readable } from "stream";
 import { randomUUID } from "node:crypto";
 import dotenv from "dotenv";
 
@@ -47,9 +46,9 @@ const pollyClient = new PollyClient({
   },
 });
 
-// Bedrock Agent (ya creado en us-east-1)
+// Bedrock Agent
 const agentClient = new BedrockAgentRuntimeClient({
-  region: process.env.AGENT_REGION || AWS_REGION, // puedes dejar vacío si el agente está en us-east-1
+  region: process.env.AGENT_REGION || AWS_REGION,
   credentials: {
     accessKeyId: process.env.AWS_ACCESS_KEY_ID,
     secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
@@ -59,14 +58,13 @@ const agentClient = new BedrockAgentRuntimeClient({
 // =================== HELPERS ===================
 async function askBedrockAgent(inputText, sessionId) {
   const cmd = new InvokeAgentCommand({
-    agentId: process.env.AGENT_ID,           // e.g. BBI4ILFEQR
-    agentAliasId: process.env.AGENT_ALIAS_ID, // e.g. alias de Test
+    agentId: process.env.AGENT_ID,            // p.ej. BBI4ILFEQR
+    agentAliasId: process.env.AGENT_ALIAS_ID, // alias
     sessionId,
     inputText,
   });
 
   const resp = await agentClient.send(cmd);
-
   const dec = new TextDecoder();
   let text = "";
   for await (const ev of resp.completion) {
@@ -75,16 +73,65 @@ async function askBedrockAgent(inputText, sessionId) {
   return text || "⚠️ El agente no devolvió contenido.";
 }
 
-// Transcribe: convierte mensajes binarios del WS en stream legible
-function createAudioStream(ws) {
-  const audioStream = new Readable({ read() {} });
+// --- Audio: parámetros seguros para Transcribe
+const TR_LANG = process.env.TR_LANG || "es-US";
+const DST_RATE = 16000;              // Transcribe estable a 16 kHz
+const BYTES_PER_SAMPLE = 2;          // PCM 16-bit LE
+const FRAME_MS = Number(process.env.TR_FRAME_MS || 20); // 20 ms recomendado
+const FRAME_BYTES = (DST_RATE * BYTES_PER_SAMPLE * FRAME_MS) / 1000; // 640
 
-  ws.on("message", (msg) => {
-    if (Buffer.isBuffer(msg)) audioStream.push(msg);
-  });
+// (opcional) tasa que llega desde el navegador; por defecto 44100
+const FRONT_SR = Number(process.env.FRONT_SR || 44100);
 
-  ws.on("close", () => audioStream.push(null));
-  return audioStream;
+// -------- util: resample Int16 srcRate -> 16k con interpolación lineal simple
+function resampleInt16(int16Src, srcRate = 44100, dstRate = DST_RATE) {
+  if (srcRate === dstRate) return int16Src;
+  const ratio = srcRate / dstRate;
+  const dstLen = Math.floor(int16Src.length / ratio);
+  const out = new Int16Array(dstLen);
+  for (let i = 0; i < dstLen; i++) {
+    const idx = i * ratio;
+    const i0 = Math.floor(idx);
+    const i1 = Math.min(i0 + 1, int16Src.length - 1);
+    const frac = idx - i0;
+    const s = int16Src[i0] * (1 - frac) + int16Src[i1] * frac;
+    out[i] = s | 0;
+  }
+  return out;
+}
+
+// -------- generador asincrónico: agrupa en frames constantes (20 ms)
+function makeAudioStreamGenerator() {
+  let buffer = Buffer.alloc(0);
+  let alive = true;
+
+  let notify = null;
+  const wait = () => new Promise((r) => (notify = r));
+
+  return {
+    // recibe Buffer PCM16 LE (normalmente 44.1k) y almacena remuestreado 16k
+    push({ chunk, sampleRate = FRONT_SR }) {
+      // Asegura longitud par (múltiplo de 2)
+      if (chunk.length % 2 === 1) chunk = chunk.subarray(0, chunk.length - 1);
+      const int16 = new Int16Array(chunk.buffer, chunk.byteOffset, chunk.byteLength / 2);
+      const resampled = resampleInt16(int16, sampleRate, DST_RATE);
+      const b = Buffer.from(resampled.buffer, resampled.byteOffset, resampled.byteLength);
+      buffer = Buffer.concat([buffer, b]);
+      if (notify) { const n = notify; notify = null; n(); }
+    },
+    stop() { alive = false; if (notify) { notify(); } },
+
+    async *iterator() {
+      while (alive) {
+        while (buffer.length >= FRAME_BYTES) {
+          const frame = buffer.subarray(0, FRAME_BYTES);
+          buffer = buffer.subarray(FRAME_BYTES);
+          yield { AudioEvent: { AudioChunk: frame } };
+        }
+        if (alive && buffer.length < FRAME_BYTES) await wait();
+      }
+    },
+  };
 }
 
 // =================== WEBSOCKET (STT -> AGENTE) ===================
@@ -92,42 +139,70 @@ wss.on("connection", async (ws) => {
   console.log("✅ Cliente conectado");
   ws.sessionId = randomUUID(); // sesión estable por conexión
 
+  // 1) preparar generador y comando de Transcribe
+  const stream = makeAudioStreamGenerator();
+
+  const cmd = new StartStreamTranscriptionCommand({
+    LanguageCode: TR_LANG,                 // "es-US" recomendado para LATAM
+    MediaSampleRateHertz: DST_RATE,        // 16000
+    MediaEncoding: "pcm",
+    AudioStream: stream.iterator(),        // frames de 20 ms → 640 bytes
+    // EnablePartialResultsStabilization: true,   // opcional
+    // PartialResultsStability: "medium",         // opcional
+  });
+
+  let transcribePromise = null;
+
   try {
-    const audioStream = createAudioStream(ws);
+    transcribePromise = transcribeClient.send(cmd);
+  } catch (err) {
+    console.error("❌ Error al iniciar Transcribe:", err);
+    try { ws.close(); } catch {}
+    return;
+  }
 
-    const cmd = new StartStreamTranscriptionCommand({
-      LanguageCode: "es-US",
-      MediaSampleRateHertz: 44100,
-      MediaEncoding: "pcm",
-      AudioStream: (async function* () {
-        for await (const chunk of audioStream) {
-          yield { AudioEvent: { AudioChunk: chunk } };
-        }
-      })(),
-    });
+  // 2) recibir audio binario del navegador y empujar al generador
+  ws.on("message", (data, isBinary) => {
+    const buf = isBinary ? data : Buffer.from(data);
+    // asume PCM16LE desde el front (Worklet/ScriptProcessor)
+    stream.push({ chunk: buf, sampleRate: FRONT_SR });
+  });
 
-    const response = await transcribeClient.send(cmd);
+  ws.on("close", async () => {
+    stream.stop();
+    try { await transcribePromise; } catch {}
+  });
 
-    for await (const event of response.TranscriptResultStream) {
-      if (!event.TranscriptEvent) continue;
-      const results = event.TranscriptEvent.Transcript.Results;
-      for (const result of results) {
-        if (result.Alternatives.length === 0) continue;
+  // 3) leer resultados de Transcribe y enviarlos al cliente
+  (async () => {
+    try {
+      const response = await transcribePromise;
+      for await (const event of response.TranscriptResultStream) {
+        if (!event.TranscriptEvent) continue;
+        const results = event.TranscriptEvent.Transcript.Results || [];
+        for (const result of results) {
+          if (result.Alternatives.length === 0) continue;
 
-        const transcript = result.Alternatives[0].Transcript;
-        ws.send(JSON.stringify({ transcript, isPartial: result.IsPartial }));
+          const transcript = (result.Alternatives[0].Transcript || "").trim();
+          ws.send(JSON.stringify({ transcript, isPartial: !!result.IsPartial }));
 
-        // Solo mensajes finales al agente
-        if (!result.IsPartial && transcript.trim()) {
-          const reply = await askBedrockAgent(transcript, ws.sessionId);
-          ws.send(JSON.stringify({ bedrockReply: reply }));
+          // Solo finales al agente
+          if (!result.IsPartial && transcript) {
+            try {
+              const reply = await askBedrockAgent(transcript, ws.sessionId);
+              ws.send(JSON.stringify({ bedrockReply: reply }));
+            } catch (e) {
+              console.error("❌ Error Bedrock Agent:", e);
+            }
+          }
         }
       }
+    } catch (err) {
+      console.error("❌ Error en Transcribe:", err);
+      try { ws.send(JSON.stringify({ error: "transcribe_failed" })); } catch {}
+      try { ws.close(); } catch {}
     }
-  } catch (err) {
-    console.error("❌ Error en Transcribe:", err);
-    try { ws.close(); } catch {}
-  }
+  })();
 });
 
 // =================== REST: CHAT TEXTO -> AGENTE ===================
@@ -135,8 +210,7 @@ app.post("/chat", async (req, res) => {
   const { prompt, sessionId } = req.body || {};
   if (!prompt || !prompt.trim()) {
     return res.status(400).json({ reply: "❌ Falta el prompt" });
-  }
-
+    }
   try {
     const sid = sessionId || randomUUID();
     const reply = await askBedrockAgent(prompt, sid);
@@ -186,9 +260,9 @@ app.post("/speak", async (req, res) => {
     const command = new SynthesizeSpeechCommand({
       OutputFormat: "mp3",
       Text: text,
-      VoiceId: "Mia",       
+      VoiceId: process.env.POLLY_VOICE_ID || "Mia",
       Engine: "neural",
-      LanguageCode: "es-MX",
+      LanguageCode: process.env.POLLY_LANG || "es-MX",
     });
 
     const pollyRes = await pollyClient.send(command, {
@@ -207,8 +281,9 @@ app.post("/speak", async (req, res) => {
       try { res.end(); } catch {}
     });
 
-    pollyRes.AudioStream.on("end", () => endTtsSession(clientId, controller));
-    pollyRes.AudioStream.on("close", () => endTtsSession(clientId, controller));
+    const end = () => endTtsSession(clientId, controller);
+    pollyRes.AudioStream.on("end", end);
+    pollyRes.AudioStream.on("close", end);
 
     pollyRes.AudioStream.pipe(res);
   } catch (err) {
