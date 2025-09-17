@@ -19,11 +19,30 @@ import dotenv from "dotenv";
 dotenv.config();
 
 const app = express();
-app.use(cors());
+app.use(cors()); // en prod puedes listar dominios: cors({ origin: ["https://tu-sitio.com"] })
 app.use(express.json());
 
+// healthcheck para Railway
+app.get("/health", (req, res) => res.status(200).json({ ok: true, time: new Date().toISOString() }));
+
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server });
+
+// === WS con path (mejor detrás de proxy) ===
+const WS_PATH = process.env.WS_PATH || "/ws";
+const wss = new WebSocketServer({ server, path: WS_PATH });
+
+// === Keep-alive para evitar timeouts del proxy ===
+wss.on("connection", (ws) => {
+  ws.isAlive = true;
+  ws.on("pong", () => (ws.isAlive = true));
+});
+const KA = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) return ws.terminate();
+    ws.isAlive = false; ws.ping();
+  });
+}, 30_000);
+wss.on("close", () => clearInterval(KA));
 
 const PORT = process.env.PORT || 4000;
 
@@ -111,7 +130,6 @@ function makeAudioStreamGenerator() {
   return {
     // recibe Buffer PCM16 LE (normalmente 44.1k) y almacena remuestreado 16k
     push({ chunk, sampleRate = FRONT_SR }) {
-      // Asegura longitud par (múltiplo de 2)
       if (chunk.length % 2 === 1) chunk = chunk.subarray(0, chunk.length - 1);
       const int16 = new Int16Array(chunk.buffer, chunk.byteOffset, chunk.byteLength / 2);
       const resampled = resampleInt16(int16, sampleRate, DST_RATE);
@@ -139,16 +157,13 @@ wss.on("connection", async (ws) => {
   console.log("✅ Cliente conectado");
   ws.sessionId = randomUUID(); // sesión estable por conexión
 
-  // 1) preparar generador y comando de Transcribe
   const stream = makeAudioStreamGenerator();
 
   const cmd = new StartStreamTranscriptionCommand({
-    LanguageCode: TR_LANG,                 // "es-US" recomendado para LATAM
-    MediaSampleRateHertz: DST_RATE,        // 16000
+    LanguageCode: TR_LANG,
+    MediaSampleRateHertz: DST_RATE,
     MediaEncoding: "pcm",
-    AudioStream: stream.iterator(),        // frames de 20 ms → 640 bytes
-    // EnablePartialResultsStabilization: true,   // opcional
-    // PartialResultsStability: "medium",         // opcional
+    AudioStream: stream.iterator(), // frames de 20 ms → 640 bytes
   });
 
   let transcribePromise = null;
@@ -161,10 +176,8 @@ wss.on("connection", async (ws) => {
     return;
   }
 
-  // 2) recibir audio binario del navegador y empujar al generador
   ws.on("message", (data, isBinary) => {
     const buf = isBinary ? data : Buffer.from(data);
-    // asume PCM16LE desde el front (Worklet/ScriptProcessor)
     stream.push({ chunk: buf, sampleRate: FRONT_SR });
   });
 
@@ -173,7 +186,6 @@ wss.on("connection", async (ws) => {
     try { await transcribePromise; } catch {}
   });
 
-  // 3) leer resultados de Transcribe y enviarlos al cliente
   (async () => {
     try {
       const response = await transcribePromise;
@@ -186,7 +198,6 @@ wss.on("connection", async (ws) => {
           const transcript = (result.Alternatives[0].Transcript || "").trim();
           ws.send(JSON.stringify({ transcript, isPartial: !!result.IsPartial }));
 
-          // Solo finales al agente
           if (!result.IsPartial && transcript) {
             try {
               const reply = await askBedrockAgent(transcript, ws.sessionId);
@@ -210,7 +221,7 @@ app.post("/chat", async (req, res) => {
   const { prompt, sessionId } = req.body || {};
   if (!prompt || !prompt.trim()) {
     return res.status(400).json({ reply: "❌ Falta el prompt" });
-    }
+  }
   try {
     const sid = sessionId || randomUUID();
     const reply = await askBedrockAgent(prompt, sid);
@@ -222,14 +233,11 @@ app.post("/chat", async (req, res) => {
 });
 
 // =================== TTS con barge-in (Polly) ===================
-// Mapa de sesiones por clientId para abortar el audio anterior
 const ttsSessions = new Map(); // clientId -> { controller }
 
 function beginTtsSession(clientId) {
   const prev = ttsSessions.get(clientId);
-  if (prev?.controller) {
-    try { prev.controller.abort(); } catch {}
-  }
+  if (prev?.controller) { try { prev.controller.abort(); } catch {} }
   const controller = new AbortController();
   ttsSessions.set(clientId, { controller });
   return controller;
@@ -240,20 +248,13 @@ function endTtsSession(clientId, controller) {
   if (cur === controller) ttsSessions.delete(clientId);
 }
 
-// Genera audio y corta el anterior si existe (barge-in)
 app.post("/speak", async (req, res) => {
   try {
     const clientId = req.query.clientId || req.header("x-client-id");
-    if (!clientId) {
-      return res
-        .status(400)
-        .json({ error: "Falta clientId (?clientId= o header x-client-id)" });
-    }
+    if (!clientId) return res.status(400).json({ error: "Falta clientId (?clientId= o header x-client-id)" });
 
     const { text } = req.body || {};
-    if (!text || !text.trim()) {
-      return res.status(400).json({ error: "Falta texto" });
-    }
+    if (!text || !text.trim()) return res.status(400).json({ error: "Falta texto" });
 
     const controller = beginTtsSession(clientId);
 
@@ -265,17 +266,12 @@ app.post("/speak", async (req, res) => {
       LanguageCode: process.env.POLLY_LANG || "es-MX",
     });
 
-    const pollyRes = await pollyClient.send(command, {
-      abortSignal: controller.signal,
-    });
+    const pollyRes = await pollyClient.send(command, { abortSignal: controller.signal });
 
     res.setHeader("Content-Type", "audio/mpeg");
 
     pollyRes.AudioStream.on("error", (err) => {
-      if (controller.signal.aborted) {
-        try { res.end(); } catch {}
-        return;
-      }
+      if (controller.signal.aborted) { try { res.end(); } catch {} return; }
       console.error("❌ Polly stream error:", err);
       if (!res.headersSent) res.status(500);
       try { res.end(); } catch {}
@@ -287,30 +283,22 @@ app.post("/speak", async (req, res) => {
 
     pollyRes.AudioStream.pipe(res);
   } catch (err) {
-    if (err?.name === "AbortError") {
-      try { res.end(); } catch {}
-      return;
-    }
+    if (err?.name === "AbortError") { try { res.end(); } catch {}; return; }
     console.error("❌ Error Polly:", err);
-    if (!res.headersSent) {
-      res.status(500).json({ error: "Error en Polly" });
-    }
+    if (!res.headersSent) res.status(500).json({ error: "Error en Polly" });
   }
 });
 
-// Cortar audio actual sin iniciar otro
 app.post("/speak/stop", (req, res) => {
   const clientId = req.query.clientId || req.header("x-client-id");
   if (!clientId) return res.status(400).json({ error: "Falta clientId" });
   const prev = ttsSessions.get(clientId);
-  if (prev?.controller) {
-    try { prev.controller.abort(); } catch {}
-  }
+  if (prev?.controller) { try { prev.controller.abort(); } catch {} }
   return res.json({ ok: true });
 });
 
 // =================== START ===================
-server.listen(PORT, () => {
-  console.log(`🚀 Servidor corriendo en http://localhost:${PORT}`);
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`🚀 Servidor corriendo en http://0.0.0.0:${PORT}  (WS path: ${WS_PATH})`);
 });
 
