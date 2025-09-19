@@ -77,8 +77,8 @@ const agentClient = new BedrockAgentRuntimeClient({
 // =================== HELPERS ===================
 async function askBedrockAgent(inputText, sessionId) {
   const cmd = new InvokeAgentCommand({
-    agentId: process.env.AGENT_ID,            // p.ej. BBI4ILFEQR
-    agentAliasId: process.env.AGENT_ALIAS_ID, // alias
+    agentId: process.env.AGENT_ID_TEXT,            // p.ej. BBI4ILFEQR
+    agentAliasId: process.env.AGENT_ALIAS_ID_TEXT, // alias
     sessionId,
     inputText,
   });
