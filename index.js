@@ -19,11 +19,30 @@ import dotenv from "dotenv";
 dotenv.config();
 
 const app = express();
-app.use(cors());
+app.use(cors()); // en prod puedes listar dominios: cors({ origin: ["https://tu-sitio.com"] })
 app.use(express.json());
 
+// healthcheck para Railway
+app.get("/health", (req, res) => res.status(200).json({ ok: true, time: new Date().toISOString() }));
+
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server });
+
+// === WS con path (mejor detrás de proxy) ===
+const WS_PATH = process.env.WS_PATH || "/ws";
+const wss = new WebSocketServer({ server, path: WS_PATH });
+
+// === Keep-alive para evitar timeouts del proxy ===
+wss.on("connection", (ws) => {
+  ws.isAlive = true;
+  ws.on("pong", () => (ws.isAlive = true));
+});
+const KA = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) return ws.terminate();
+    ws.isAlive = false; ws.ping();
+  });
+}, 30_000);
+wss.on("close", () => clearInterval(KA));
 
 const PORT = process.env.PORT || 4000;
 
@@ -248,6 +267,7 @@ app.post("/chat", async (req, res) => {
 });
 
 // =================== TTS con barge-in (Polly) ===================
+
 const ttsSessions = new Map();
 
 function beginTtsSession(clientId) {
@@ -270,16 +290,10 @@ function endTtsSession(clientId, controller) {
 app.post("/speak", async (req, res) => {
   try {
     const clientId = req.query.clientId || req.header("x-client-id");
-    if (!clientId) {
-      return res
-        .status(400)
-        .json({ error: "Falta clientId (?clientId= o header x-client-id)" });
-    }
+    if (!clientId) return res.status(400).json({ error: "Falta clientId (?clientId= o header x-client-id)" });
 
     const { text } = req.body || {};
-    if (!text || !text.trim()) {
-      return res.status(400).json({ error: "Falta texto" });
-    }
+    if (!text || !text.trim()) return res.status(400).json({ error: "Falta texto" });
 
     const controller = beginTtsSession(clientId);
 
@@ -291,9 +305,7 @@ app.post("/speak", async (req, res) => {
       LanguageCode: process.env.POLLY_LANG || "es-MX",
     });
 
-    const pollyRes = await pollyClient.send(command, {
-      abortSignal: controller.signal,
-    });
+    const pollyRes = await pollyClient.send(command, { abortSignal: controller.signal });
 
     res.setHeader("Content-Type", "audio/mpeg");
 
@@ -324,9 +336,7 @@ app.post("/speak", async (req, res) => {
       return;
     }
     console.error("❌ Error Polly:", err);
-    if (!res.headersSent) {
-      res.status(500).json({ error: "Error en Polly" });
-    }
+    if (!res.headersSent) res.status(500).json({ error: "Error en Polly" });
   }
 });
 
@@ -343,6 +353,6 @@ app.post("/speak/stop", (req, res) => {
 });
 
 // =================== START ===================
-server.listen(PORT, () => {
-  console.log(`🚀 Servidor corriendo en http://localhost:${PORT}`);
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`🚀 Servidor corriendo en http://0.0.0.0:${PORT}  (WS path: ${WS_PATH})`);
 });
