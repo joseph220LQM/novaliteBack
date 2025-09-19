@@ -20,6 +20,7 @@ dotenv.config();
 
 const app = express();
 app.use(cors()); // en prod puedes listar dominios: cors({ origin: ["https://tu-sitio.com"] })
+app.options('*', cors());
 app.use(express.json());
 
 // healthcheck para Railway
