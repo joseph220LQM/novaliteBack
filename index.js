@@ -1,4 +1,4 @@
-// index.js — MOZART: Transcribe (WS) + Bedrock Agent + Polly (barge-in)
+// index.js — MOZART: Transcribe (WS) + Bedrock Agent (voz/chat) + Polly (barge-in)
 
 import express from "express";
 import http from "http";
@@ -56,10 +56,19 @@ const agentClient = new BedrockAgentRuntimeClient({
 });
 
 // =================== HELPERS ===================
-async function askBedrockAgent(inputText, sessionId) {
+async function askBedrockAgent(inputText, sessionId, mode = "text") {
+  const agentId =
+    mode === "voice"
+      ? process.env.AGENT_ID_VOICE
+      : process.env.AGENT_ID_TEXT;
+  const agentAliasId =
+    mode === "voice"
+      ? process.env.AGENT_ALIAS_ID_VOICE
+      : process.env.AGENT_ALIAS_ID_TEXT;
+
   const cmd = new InvokeAgentCommand({
-    agentId: process.env.AGENT_ID,            // p.ej. BBI4ILFEQR
-    agentAliasId: process.env.AGENT_ALIAS_ID, // alias
+    agentId,
+    agentAliasId,
     sessionId,
     inputText,
   });
@@ -75,15 +84,14 @@ async function askBedrockAgent(inputText, sessionId) {
 
 // --- Audio: parámetros seguros para Transcribe
 const TR_LANG = process.env.TR_LANG || "es-US";
-const DST_RATE = 16000;              // Transcribe estable a 16 kHz
-const BYTES_PER_SAMPLE = 2;          // PCM 16-bit LE
-const FRAME_MS = Number(process.env.TR_FRAME_MS || 20); // 20 ms recomendado
-const FRAME_BYTES = (DST_RATE * BYTES_PER_SAMPLE * FRAME_MS) / 1000; // 640
+const DST_RATE = 16000; // Transcribe estable a 16 kHz
+const BYTES_PER_SAMPLE = 2;
+const FRAME_MS = Number(process.env.TR_FRAME_MS || 20);
+const FRAME_BYTES = (DST_RATE * BYTES_PER_SAMPLE * FRAME_MS) / 1000;
 
-// (opcional) tasa que llega desde el navegador; por defecto 44100
 const FRONT_SR = Number(process.env.FRONT_SR || 44100);
 
-// -------- util: resample Int16 srcRate -> 16k con interpolación lineal simple
+// -------- util: resample Int16 srcRate -> 16k
 function resampleInt16(int16Src, srcRate = 44100, dstRate = DST_RATE) {
   if (srcRate === dstRate) return int16Src;
   const ratio = srcRate / dstRate;
@@ -100,7 +108,7 @@ function resampleInt16(int16Src, srcRate = 44100, dstRate = DST_RATE) {
   return out;
 }
 
-// -------- generador asincrónico: agrupa en frames constantes (20 ms)
+// -------- generador asincrónico: agrupa en frames
 function makeAudioStreamGenerator() {
   let buffer = Buffer.alloc(0);
   let alive = true;
@@ -109,17 +117,32 @@ function makeAudioStreamGenerator() {
   const wait = () => new Promise((r) => (notify = r));
 
   return {
-    // recibe Buffer PCM16 LE (normalmente 44.1k) y almacena remuestreado 16k
     push({ chunk, sampleRate = FRONT_SR }) {
-      // Asegura longitud par (múltiplo de 2)
       if (chunk.length % 2 === 1) chunk = chunk.subarray(0, chunk.length - 1);
-      const int16 = new Int16Array(chunk.buffer, chunk.byteOffset, chunk.byteLength / 2);
+      const int16 = new Int16Array(
+        chunk.buffer,
+        chunk.byteOffset,
+        chunk.byteLength / 2
+      );
       const resampled = resampleInt16(int16, sampleRate, DST_RATE);
-      const b = Buffer.from(resampled.buffer, resampled.byteOffset, resampled.byteLength);
+      const b = Buffer.from(
+        resampled.buffer,
+        resampled.byteOffset,
+        resampled.byteLength
+      );
       buffer = Buffer.concat([buffer, b]);
-      if (notify) { const n = notify; notify = null; n(); }
+      if (notify) {
+        const n = notify;
+        notify = null;
+        n();
+      }
     },
-    stop() { alive = false; if (notify) { notify(); } },
+    stop() {
+      alive = false;
+      if (notify) {
+        notify();
+      }
+    },
 
     async *iterator() {
       while (alive) {
@@ -134,46 +157,43 @@ function makeAudioStreamGenerator() {
   };
 }
 
-// =================== WEBSOCKET (STT -> AGENTE) ===================
+// =================== WEBSOCKET (STT -> AGENTE VOZ) ===================
 wss.on("connection", async (ws) => {
-  console.log("✅ Cliente conectado");
-  ws.sessionId = randomUUID(); // sesión estable por conexión
+  console.log("✅ Cliente conectado (voz)");
+  ws.sessionId = randomUUID();
 
-  // 1) preparar generador y comando de Transcribe
   const stream = makeAudioStreamGenerator();
 
   const cmd = new StartStreamTranscriptionCommand({
-    LanguageCode: TR_LANG,                 // "es-US" recomendado para LATAM
-    MediaSampleRateHertz: DST_RATE,        // 16000
+    LanguageCode: TR_LANG,
+    MediaSampleRateHertz: DST_RATE,
     MediaEncoding: "pcm",
-    AudioStream: stream.iterator(),        // frames de 20 ms → 640 bytes
-    // EnablePartialResultsStabilization: true,   // opcional
-    // PartialResultsStability: "medium",         // opcional
+    AudioStream: stream.iterator(),
   });
 
   let transcribePromise = null;
-
   try {
     transcribePromise = transcribeClient.send(cmd);
   } catch (err) {
     console.error("❌ Error al iniciar Transcribe:", err);
-    try { ws.close(); } catch {}
+    try {
+      ws.close();
+    } catch {}
     return;
   }
 
-  // 2) recibir audio binario del navegador y empujar al generador
   ws.on("message", (data, isBinary) => {
     const buf = isBinary ? data : Buffer.from(data);
-    // asume PCM16LE desde el front (Worklet/ScriptProcessor)
     stream.push({ chunk: buf, sampleRate: FRONT_SR });
   });
 
   ws.on("close", async () => {
     stream.stop();
-    try { await transcribePromise; } catch {}
+    try {
+      await transcribePromise;
+    } catch {}
   });
 
-  // 3) leer resultados de Transcribe y enviarlos al cliente
   (async () => {
     try {
       const response = await transcribePromise;
@@ -182,53 +202,60 @@ wss.on("connection", async (ws) => {
         const results = event.TranscriptEvent.Transcript.Results || [];
         for (const result of results) {
           if (result.Alternatives.length === 0) continue;
-
           const transcript = (result.Alternatives[0].Transcript || "").trim();
           ws.send(JSON.stringify({ transcript, isPartial: !!result.IsPartial }));
 
-          // Solo finales al agente
           if (!result.IsPartial && transcript) {
             try {
-              const reply = await askBedrockAgent(transcript, ws.sessionId);
+              const reply = await askBedrockAgent(
+                transcript,
+                ws.sessionId,
+                "voice"
+              );
               ws.send(JSON.stringify({ bedrockReply: reply }));
             } catch (e) {
-              console.error("❌ Error Bedrock Agent:", e);
+              console.error("❌ Error Bedrock Agent voz:", e);
             }
           }
         }
       }
     } catch (err) {
       console.error("❌ Error en Transcribe:", err);
-      try { ws.send(JSON.stringify({ error: "transcribe_failed" })); } catch {}
-      try { ws.close(); } catch {}
+      try {
+        ws.send(JSON.stringify({ error: "transcribe_failed" }));
+      } catch {}
+      try {
+        ws.close();
+      } catch {}
     }
   })();
 });
 
-// =================== REST: CHAT TEXTO -> AGENTE ===================
+// =================== REST: CHAT TEXTO -> AGENTE TEXTO ===================
 app.post("/chat", async (req, res) => {
   const { prompt, sessionId } = req.body || {};
   if (!prompt || !prompt.trim()) {
     return res.status(400).json({ reply: "❌ Falta el prompt" });
-    }
+  }
   try {
     const sid = sessionId || randomUUID();
-    const reply = await askBedrockAgent(prompt, sid);
+    const reply = await askBedrockAgent(prompt, sid, "text");
     return res.json({ reply, sessionId: sid });
   } catch (error) {
-    console.error("❌ Error con Bedrock Agent:", error);
+    console.error("❌ Error con Bedrock Agent (texto):", error);
     return res.status(500).json({ reply: "❌ Error al invocar el Agente" });
   }
 });
 
 // =================== TTS con barge-in (Polly) ===================
-// Mapa de sesiones por clientId para abortar el audio anterior
-const ttsSessions = new Map(); // clientId -> { controller }
+const ttsSessions = new Map();
 
 function beginTtsSession(clientId) {
   const prev = ttsSessions.get(clientId);
   if (prev?.controller) {
-    try { prev.controller.abort(); } catch {}
+    try {
+      prev.controller.abort();
+    } catch {}
   }
   const controller = new AbortController();
   ttsSessions.set(clientId, { controller });
@@ -240,7 +267,6 @@ function endTtsSession(clientId, controller) {
   if (cur === controller) ttsSessions.delete(clientId);
 }
 
-// Genera audio y corta el anterior si existe (barge-in)
 app.post("/speak", async (req, res) => {
   try {
     const clientId = req.query.clientId || req.header("x-client-id");
@@ -273,12 +299,16 @@ app.post("/speak", async (req, res) => {
 
     pollyRes.AudioStream.on("error", (err) => {
       if (controller.signal.aborted) {
-        try { res.end(); } catch {}
+        try {
+          res.end();
+        } catch {}
         return;
       }
       console.error("❌ Polly stream error:", err);
       if (!res.headersSent) res.status(500);
-      try { res.end(); } catch {}
+      try {
+        res.end();
+      } catch {}
     });
 
     const end = () => endTtsSession(clientId, controller);
@@ -288,7 +318,9 @@ app.post("/speak", async (req, res) => {
     pollyRes.AudioStream.pipe(res);
   } catch (err) {
     if (err?.name === "AbortError") {
-      try { res.end(); } catch {}
+      try {
+        res.end();
+      } catch {}
       return;
     }
     console.error("❌ Error Polly:", err);
@@ -298,13 +330,14 @@ app.post("/speak", async (req, res) => {
   }
 });
 
-// Cortar audio actual sin iniciar otro
 app.post("/speak/stop", (req, res) => {
   const clientId = req.query.clientId || req.header("x-client-id");
   if (!clientId) return res.status(400).json({ error: "Falta clientId" });
   const prev = ttsSessions.get(clientId);
   if (prev?.controller) {
-    try { prev.controller.abort(); } catch {}
+    try {
+      prev.controller.abort();
+    } catch {}
   }
   return res.json({ ok: true });
 });
@@ -313,4 +346,3 @@ app.post("/speak/stop", (req, res) => {
 server.listen(PORT, () => {
   console.log(`🚀 Servidor corriendo en http://localhost:${PORT}`);
 });
-
