@@ -165,7 +165,13 @@ function makeAudioStreamGenerator() {
 // =================== WEBSOCKET (STT -> AGENTE) ===================
 wss.on("connection", async (ws) => {
   console.log("✅ Cliente conectado");
-  ws.sessionId = randomUUID(); // sesión estable por conexión
+  try {
+    const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+    ws.sessionId = url.searchParams.get("sessionId") || randomUUID();
+  } catch (e) {
+    ws.sessionId = randomUUID();
+  }
+  console.log("sessionId (WS):", ws.sessionId);
 
   const stream = makeAudioStreamGenerator();
 
@@ -233,7 +239,7 @@ app.post("/chat", async (req, res) => {
     return res.status(400).json({ reply: "❌ Falta el prompt" });
   }
   try {
-    const sid = sessionId || randomUUID();
+    const sid = sessionId || req.header("x-client-id") || randomUUID();
     const reply = await askBedrockAgent(prompt, sid, "chat");
     return res.json({ reply, sessionId: sid });
   } catch (error) {
