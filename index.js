@@ -75,16 +75,9 @@ const agentClient = new BedrockAgentRuntimeClient({
 });
 
 // =================== HELPERS ===================
-async function askBedrockAgent(inputText, sessionId, mode="chat") {
-  let agentId, agentAliasId;
-
-  if (mode === "voice") {
-    agentId = process.env.AGENT_ID_VOICE;
-    agentAliasId = process.env.AGENT_ALIAS_ID_VOICE;
-  } else {
-    agentId = process.env.AGENT_ID_TEXT;
-    agentAliasId = process.env.AGENT_ALIAS_ID_TEXT;
-  }
+async function askBedrockAgent(inputText, sessionId) {
+  const agentId = process.env.AGENT_ID;
+  const agentAliasId = process.env.AGENT_ALIAS_ID;
 
   const cmd = new InvokeAgentCommand({
     agentId,
@@ -216,7 +209,7 @@ wss.on("connection", async (ws) => {
 
           if (!result.IsPartial && transcript) {
             try {
-              const reply = await askBedrockAgent(transcript, ws.sessionId, "voice");
+              const reply = await askBedrockAgent(transcript, ws.sessionId);
               ws.send(JSON.stringify({ bedrockReply: reply }));
             } catch (e) {
               console.error("❌ Error Bedrock Agent:", e);
@@ -240,7 +233,7 @@ app.post("/chat", async (req, res) => {
   }
   try {
     const sid = sessionId || req.header("x-client-id") || randomUUID();
-    const reply = await askBedrockAgent(prompt, sid, "chat");
+    const reply = await askBedrockAgent(prompt, sid);
     return res.json({ reply, sessionId: sid });
   } catch (error) {
     console.error("❌ Error con Bedrock Agent:", error);
