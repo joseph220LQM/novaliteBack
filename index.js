@@ -12,6 +12,7 @@ import {
   BedrockAgentRuntimeClient,
   InvokeAgentCommand,
 } from "@aws-sdk/client-bedrock-agent-runtime";
+import { ConnectClient, StartOutboundVoiceContactCommand } from "@aws-sdk/client-connect";
 import { PollyClient, SynthesizeSpeechCommand } from "@aws-sdk/client-polly";
 import { randomUUID } from "node:crypto";
 import dotenv from "dotenv";
@@ -48,6 +49,14 @@ const PORT = process.env.PORT || 4000;
 
 // =================== AWS CLIENTS ===================
 const AWS_REGION = process.env.AWS_REGION || "us-east-1";
+
+const connectClient = new ConnectClient({
+  region: AWS_REGION,
+  credentials: {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+  },
+});
 
 const transcribeClient = new TranscribeStreamingClient({
   region: AWS_REGION,
@@ -305,6 +314,35 @@ app.post("/speak/stop", (req, res) => {
   if (prev?.controller) { try { prev.controller.abort(); } catch {} }
   return res.json({ ok: true });
 });
+
+app.post("/call", async (req, res) => {
+  try {
+    const { phoneNumber, nombre, motivo } = req.body;
+
+    if (!phoneNumber) {
+      return res.status(400).json({ error: "Falta el número de teléfono" });
+    }
+
+    const cmd = new StartOutboundVoiceContactCommand({
+      InstanceId: process.env.CONNECT_INSTANCE_ID,   // en tu .env
+      ContactFlowId: process.env.CONNECT_FLOW_ID,   // en tu .env (flujo OUTBOUND)
+      DestinationPhoneNumber: phoneNumber,          // ej: "+573001234567"
+      SourcePhoneNumber: process.env.SOURCE_NUMBER, // el número que reclamaste en Connect
+      Attributes: {
+        NombrePaciente: nombre || "Paciente",
+        Motivo: motivo || "Consulta médica"
+      }
+    });
+
+    const resp = await connectClient.send(cmd);
+    res.json({ ok: true, contactId: resp.ContactId });
+
+  } catch (err) {
+    console.error("❌ Error al disparar outbound:", err);
+    res.status(500).json({ error: "No se pudo iniciar la llamada" });
+  }
+});
+
 
 // =================== START ===================
 server.listen(PORT, "0.0.0.0", () => {
